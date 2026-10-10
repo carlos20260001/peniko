@@ -25,17 +25,23 @@ upstream but not needed in the port: path construction lives in `epaint` and
 
 | Rust module | Purpose | TS status |
 |---|---|---|
-| `style.rs` (`Fill`, `Style`) | fill description; only the solid case is needed | TODO |
-| `color` | premultiplied linear RGBA, colour-space conversion | TODO |
+| `style.rs` (`Fill`, `Style`) | fill description; only the solid case is needed | done |
+| `color` | premultiplied linear RGBA | shared with `@egui-node/ecolor` |
 
 Not ported: `blend.rs` (`BlendMode`, `Compose`, `Mix`), `gradient.rs`,
 `image.rs`, `brush.rs`, `blurred_rounded_rect.rs`.
 
-## Dependencies
+## Why this port is so small
 
-None. The colour types should reuse `@egui-node/ecolor` (`Color32`, `Rgba`)
-rather than duplicating them, so the port and `epaint` share one colour
-implementation.
+`epaint` does its own shape tessellation in `epaint/src/tessellator.rs`; it
+only reaches `vello_cpu` to rasterize glyphs into the font atlas, and that is
+always a single solid fill. So the reachable subset of `peniko` really is one
+variant, and `Extend`/`WrapMode` exist only because `Brush` carries them
+upstream.
+
+Colour types are not redefined. `SolidBrush` is generic over the colour value
+so the pipeline shares `@egui-node/ecolor` (`Color32`, `Rgba`) rather than
+having two colour implementations.
 
 ## Licence
 

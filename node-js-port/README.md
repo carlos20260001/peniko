@@ -1,15 +1,16 @@
 # Node.js port: `peniko` replacement
 
-TypeScript replacement for [`peniko`](https://github.com/linebender/peniko),
-for the subset `egui` depends on.
+TypeScript port of [`peniko`](https://github.com/linebender/peniko) and of its
+colour dependency, [`color`](https://crates.io/crates/color), for the subset
+`egui` depends on.
 
 ## Why
 
 `peniko` is `vello_cpu`'s paint layer: fills, strokes, brushes, gradients and
 blend modes. `epaint` only ever uses one of these — **a plain solid fill** of a
-glyph outline. Everything else (gradients, image brushes, blend modes,
-`BlurredRoundedRect`) is vector-graphics API surface that the headless port
-does not reproduce.
+glyph outline — but the *types* it names have to be the real ones, because vello
+composites in **premultiplied linear-light sRGB** and every blend, gradient and
+antialiased edge depends on that.
 
 Note that `peniko` re-exports `kurbo` for path geometry. That is convenient
 upstream but not needed in the port: path construction lives in `epaint` and
@@ -19,30 +20,42 @@ upstream but not needed in the port: path construction lives in `epaint` and
 
 - Crate: `peniko` (its own repo, also vendored inside `linebender/vello`).
 - Version egui pins: `0.6.1`.
+- Colour crate: `color` 0.3.3, vendored at `../color/`.
 - Licence: `Apache-2.0 OR MIT` — identical to egui's own dual licence.
 
-## Modules to port
+## Layout
 
-| Rust module | Purpose | TS status |
+The module tree mirrors the crates', so a ported file can be diffed against the
+Rust it came from:
+
+| Rust module | Port | Notes |
 |---|---|---|
-| `style.rs` (`Fill`, `Style`) | fill description; only the solid case is needed | done |
-| `color` | premultiplied linear RGBA | shared with `@egui-node/ecolor` |
+| `peniko/src/lib.rs` | `src/lib.ts` | crate root, re-exports |
+| `peniko/src/{blend,brush,gradient,image,style,blurred_rounded_rect}.rs` | `src/{blend,brush,gradient,image,style,blurred_rounded_rect}.ts` | |
+| `color/src/{colorspace,color,rgba8,chromaticity,tag,floatfuncs}.rs` | `src/color/{colorspace,color,rgba8,chromaticity,tag,floatfuncs}.ts` | |
+| `color/src/{cache_key,dynamic,flags,gradient,parse,serialize,impl_bytemuck}.rs`, `palette/`, `x11_colors.rs` | same names, note-only | see each file for why |
+| — | `src/compose.ts` | vello's `fine::highp` blend/compose arithmetic |
+| — | `src/fill.ts` | an earlier iteration's convenience layer; see its header |
 
-Not ported: `blend.rs` (`BlendMode`, `Compose`, `Mix`), `gradient.rs`,
-`image.rs`, `brush.rs`, `blurred_rounded_rect.rs`.
+Floating point is `f64` here and `f32` upstream, so results agree to about seven
+significant digits rather than bit for bit. The one place that is observable is
+quantization to `u8`, where a value upstream lands on exactly can come out one
+off.
 
-## Why this port is so small
+## What the colour port covers
 
-`epaint` does its own shape tessellation in `epaint/src/tessellator.rs`; it
-only reaches `vello_cpu` to rasterize glyphs into the font atlas, and that is
-always a single solid fill. So the reachable subset of `peniko` really is one
-variant, and `Extend`/`WrapMode` exist only because `Brush` carries them
-upstream.
+- The sRGB transfer functions (`srgb_to_lin`, `lin_to_srgb`), including the
+  `copysign` sign handling for negative inputs.
+- `ColorSpace` with the `Srgb` and `LinearSrgb` descriptors, colour-space
+  conversion, and the Bradford chromatic-adaptation matrices.
+- `OpaqueColor`, `AlphaColor` and `PremulColor`, with premultiplication,
+  un-premultiplication, `convert`, `multiply_alpha`, `map` and `to_rgba8`.
+- `Rgba8` and `PremulRgba8`, including the u8 round trip.
 
-Colour types are not redefined. `SolidBrush` is generic over the colour value
-so the pipeline shares `@egui-node/ecolor` (`Color32`, `Rgba`) rather than
-having two colour implementations.
+Not ported: the dynamic (runtime-tagged) colour type and the CSS parser that
+produces it, the interpolation iterators, the named-colour tables, and the
+bytemuck/serde derives. Each carries a note in place.
 
 ## Licence
 
-This port is `MIT OR Apache-2.0`, matching the upstream crate.
+This port is `MIT OR Apache-2.0`, matching the upstream crates.

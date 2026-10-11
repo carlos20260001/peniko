@@ -26,16 +26,35 @@
  * `set_sat` helpers, so the luminance weights match even where the spec's are
  * written differently.
  *
- * Colours are straight (unpremultiplied) RGBA in 0..=1 throughout. The port
- * operates on plain numbers rather than vello's explicit SIMD types, which is a
- * pure representation change: the arithmetic is identical and the scalar path
- * is what a Node process gets.
+ * ## Colour
+ *
+ * The port's earlier hand-rolled `Color4` is gone. `mix` takes straight
+ * `AlphaColor`s and `compose` returns a `PremulColor`, so a caller cannot
+ * accidentally feed the blend a premultiplied colour or write a straight one
+ * into a premultiplied target. Colours stay straight and in 0..=1 for the
+ * per-channel arithmetic, which is what the spec is written for; the conversion
+ * to and from that is the colour types' `premultiply` / `un_premultiply`, and it
+ * happens here rather than at every call site.
+ *
+ * The types are generic over the colour space, because every formula below is
+ * per-channel and therefore space-agnostic. Whether the *pipeline* should be in
+ * linear light is not this module's decision — see the crate README. What is
+ * this module's decision, inherited from the arithmetic it ports, is that the
+ * premultiply at the end of `compose` clamps; see the note on `premultiply`.
  */
 
-import { Compose, Mix } from './peniko.js';
+import { AlphaColor, PremulColor } from './color/color.js';
+import type { ColorSpace } from './color/lib.js';
+import { Compose, Mix } from './blend.js';
 
-/** A straight RGBA colour, 0..=1 per channel. */
-export interface Color4 {
+/**
+ * A straight RGBA colour as four plain numbers.
+ *
+ * The per-channel helpers below mutate in place, which is how upstream spells
+ * `set_lum` and `clip_color`; this is their working shape, and the boundaries
+ * of the module convert to and from the colour types.
+ */
+interface Straight {
   r: number;
   g: number;
   b: number;
@@ -44,13 +63,39 @@ export interface Color4 {
 
 const clamp01 = (v: number): number => (v < 0 ? 0 : v > 1 ? 1 : v);
 
+function to_straight<CS extends ColorSpace>(c: AlphaColor<CS>): Straight {
+  const [r, g, b, a] = c.components;
+  return { r, g, b, a };
+}
+
+function from_straight<CS extends ColorSpace>(s: Straight, cs: CS): AlphaColor<CS> {
+  return new AlphaColor([s.r, s.g, s.b, s.a], cs);
+}
+
+/**
+ * The premultiply this module's arithmetic is written against, and the one the
+ * exported `premultiply` delegates to.
+ *
+ * It clamps, which `AlphaColor::premultiply` does not: the compositing formulas
+ * below are vello's `apply_alpha` followed by the Porter-Duff combination, and
+ * the result is read back out of a `PremulColor` that is expected to be in
+ * gamut. The clamp is therefore part of the arithmetic, not a shortcut — see the
+ * note on the exported `premultiply`.
+ */
+function premultiply_straight<CS extends ColorSpace>(s: Straight, cs: CS): PremulColor<CS> {
+  return new PremulColor(
+    [clamp01(s.r * s.a), clamp01(s.g * s.a), clamp01(s.b * s.a), clamp01(s.a)],
+    cs,
+  );
+}
+
 /** Luminance, as vello's `lum`: 0.3R + 0.59G + 0.11B. */
-function lum(c: Color4): number {
+function lum(c: Straight): number {
   return 0.3 * c.r + 0.59 * c.g + 0.11 * c.b;
 }
 
 /** Saturation, as vello's `sat`: max - min. */
-function sat(c: Color4): number {
+function sat(c: Straight): number {
   return Math.max(c.r, c.g, c.b) - Math.min(c.r, c.g, c.b);
 }
 
@@ -64,7 +109,7 @@ function sat(c: Color4): number {
  * (0.8, 0.4, 0.4), the shift gives (0.28, -0.12, -0.12); clamping leaves
  * (0.28, 0, 0) while `clip_color` moves all three to (0.40, 0, 0).
  */
-function setLum(c: Color4, l: number): void {
+function setLum(c: Straight, l: number): void {
   const d = l - lum(c);
   c.r = c.r + d;
   c.g = c.g + d;
@@ -79,7 +124,7 @@ function setLum(c: Color4, l: number): void {
  * A channel of an already-grey colour maps to 0, not to the minimum, which is
  * what vello's `scale_sat_channel` does for a zero-saturation input.
  */
-function setSat(c: Color4, s: number): void {
+function setSat(c: Straight, s: number): void {
   const mn = Math.min(c.r, c.g, c.b);
   const cur = Math.max(c.r, c.g, c.b) - mn;
   const channel = (v: number): number => (cur === 0 ? 0 : (v - mn) * s / cur);
@@ -90,7 +135,7 @@ function setSat(c: Color4, s: number): void {
 }
 
 /** CSS `ClipColor` / vello's `clip_color`. */
-function clipColor(c: Color4): void {
+function clipColor(c: Straight): void {
   const l = lum(c);
   const n = Math.min(c.r, c.g, c.b);
   const x = Math.max(c.r, c.g, c.b);
@@ -113,7 +158,17 @@ function clipColor(c: Color4): void {
  *
  * The result is straight colour; alpha is handled separately by `compose`.
  */
-export function mix(src: Color4, bg: Color4, mode: Mix): Color4 {
+export function mix<CS extends ColorSpace>(
+  src: AlphaColor<CS>,
+  bg: AlphaColor<CS>,
+  mode: Mix,
+): AlphaColor<CS> {
+  const s = to_straight(src);
+  const b = to_straight(bg);
+  return from_straight(mixStraight(s, b, mode), src.cs);
+}
+
+function mixStraight(src: Straight, bg: Straight, mode: Mix): Straight {
   switch (mode) {
     case Mix.Normal:
       return { ...src };
@@ -188,7 +243,7 @@ export function mix(src: Color4, bg: Color4, mode: Mix): Color4 {
 }
 
 /** Applies a per-channel function across RGB, keeping alpha. */
-function per(f: (cs: number, cb: number) => number, src: Color4, bg: Color4): Color4 {
+function per(f: (cs: number, cb: number) => number, src: Straight, bg: Straight): Straight {
   return {
     r: f(src.r, bg.r),
     g: f(src.g, bg.g),
@@ -237,22 +292,24 @@ function softLight(cs: number, cb: number): number {
 /**
  * Composites a source over a destination, as vello's `compose`.
  *
- * `src` and `bg` are straight (unpremultiplied) RGBA; the result is
+ * `src` and `bg` are straight (unpremultiplied) colours; the result is
  * **premultiplied** by the source's alpha, which is what the caller expects to
  * write into a premultiplied buffer.
  *
  * `(1 - bg_a) * src + bg_a * mixed`, premultiplied by `src_a`.
  */
-export function compose(
-  src: Color4,
-  bg: Color4,
+export function compose<CS extends ColorSpace>(
+  src: AlphaColor<CS>,
+  bg: AlphaColor<CS>,
   mode: { readonly mix: Mix; readonly compose: Compose },
-): Color4 {
-  const mixed = mix(src, bg, mode.mix);
+): PremulColor<CS> {
+  const s = to_straight(src);
+  const b = to_straight(bg);
+  const mixed = mixStraight(s, b, mode.mix);
 
   switch (mode.compose) {
     case Compose.Clear:
-      return { r: 0, g: 0, b: 0, a: 0 };
+      return premultiply_straight({ r: 0, g: 0, b: 0, a: 0 }, src.cs);
 
     case Compose.Copy:
       return premultiply(src);
@@ -263,84 +320,116 @@ export function compose(
     case Compose.SrcOver:
       // The same (1 - bg_a) * src + bg_a * mixed form as the general path,
       // spelled out because this is the mode every caller uses.
-      return premultiply({
-        r: (1 - bg.a) * mixed.r + bg.a * mixed.r,
-        g: (1 - bg.a) * mixed.g + bg.a * mixed.g,
-        b: (1 - bg.a) * mixed.b + bg.a * mixed.b,
-        a: src.a + bg.a * (1 - src.a),
-      });
+      return premultiply_straight(
+        {
+          r: (1 - b.a) * mixed.r + b.a * mixed.r,
+          g: (1 - b.a) * mixed.g + b.a * mixed.g,
+          b: (1 - b.a) * mixed.b + b.a * mixed.b,
+          a: s.a + b.a * (1 - s.a),
+        },
+        src.cs,
+      );
 
     case Compose.DestOver:
-      return premultiply({
-        r: bg.r * bg.a + mixed.r * (1 - bg.a) * src.a,
-        g: bg.g * bg.a + mixed.g * (1 - bg.a) * src.a,
-        b: bg.b * bg.a + mixed.b * (1 - bg.a) * src.a,
-        a: bg.a + src.a * (1 - bg.a),
-      });
+      return premultiply_straight(
+        {
+          r: b.r * b.a + mixed.r * (1 - b.a) * s.a,
+          g: b.g * b.a + mixed.g * (1 - b.a) * s.a,
+          b: b.b * b.a + mixed.b * (1 - b.a) * s.a,
+          a: b.a + s.a * (1 - b.a),
+        },
+        src.cs,
+      );
 
     case Compose.SrcIn:
-      return premultiply({ r: mixed.r, g: mixed.g, b: mixed.b, a: src.a * bg.a });
+      return premultiply_straight(
+        { r: mixed.r, g: mixed.g, b: mixed.b, a: s.a * b.a },
+        src.cs,
+      );
 
     case Compose.DestIn:
-      return premultiply({ r: bg.r, g: bg.g, b: bg.b, a: src.a * bg.a });
+      return premultiply_straight(
+        { r: b.r, g: b.g, b: b.b, a: s.a * b.a },
+        src.cs,
+      );
 
     case Compose.SrcOut:
-      return premultiply({ r: mixed.r, g: mixed.g, b: mixed.b, a: src.a * (1 - bg.a) });
+      return premultiply_straight(
+        { r: mixed.r, g: mixed.g, b: mixed.b, a: s.a * (1 - b.a) },
+        src.cs,
+      );
 
     case Compose.DestOut:
-      return premultiply({ r: bg.r, g: bg.g, b: bg.b, a: bg.a * (1 - src.a) });
+      return premultiply_straight(
+        { r: b.r, g: b.g, b: b.b, a: b.a * (1 - s.a) },
+        src.cs,
+      );
 
     case Compose.SrcAtop:
-      return premultiply({
-        r: mixed.r * src.a * bg.a + bg.r * (1 - src.a) * bg.a,
-        g: mixed.g * src.a * bg.a + bg.g * (1 - src.a) * bg.a,
-        b: mixed.b * src.a * bg.a + bg.b * (1 - src.a) * bg.a,
-        a: src.a * bg.a + bg.a * (1 - src.a) * bg.a,
-      });
+      return premultiply_straight(
+        {
+          r: mixed.r * s.a * b.a + b.r * (1 - s.a) * b.a,
+          g: mixed.g * s.a * b.a + b.g * (1 - s.a) * b.a,
+          b: mixed.b * s.a * b.a + b.b * (1 - s.a) * b.a,
+          a: s.a * b.a + b.a * (1 - s.a) * b.a,
+        },
+        src.cs,
+      );
 
     case Compose.DestAtop:
-      return premultiply({
-        r: mixed.r * src.a * (1 - bg.a) + bg.r * bg.a * (1 - src.a),
-        g: mixed.g * src.a * (1 - bg.a) + bg.g * bg.a * (1 - src.a),
-        b: mixed.b * src.a * (1 - bg.a) + bg.b * bg.a * (1 - src.a),
-        a: src.a * (1 - bg.a) + bg.a * (1 - src.a),
-      });
+      return premultiply_straight(
+        {
+          r: mixed.r * s.a * (1 - b.a) + b.r * b.a * (1 - s.a),
+          g: mixed.g * s.a * (1 - b.a) + b.g * b.a * (1 - s.a),
+          b: mixed.b * s.a * (1 - b.a) + b.b * b.a * (1 - s.a),
+          a: s.a * (1 - b.a) + b.a * (1 - s.a),
+        },
+        src.cs,
+      );
 
     case Compose.Xor:
-      return premultiply({
-        r: mixed.r * src.a * (1 - bg.a) + bg.r * bg.a * (1 - src.a),
-        g: mixed.g * src.a * (1 - bg.a) + bg.g * bg.a * (1 - src.a),
-        b: mixed.b * src.a * (1 - bg.a) + bg.b * bg.a * (1 - src.a),
-        a: src.a * (1 - bg.a) + bg.a * (1 - src.a),
-      });
+      return premultiply_straight(
+        {
+          r: mixed.r * s.a * (1 - b.a) + b.r * b.a * (1 - s.a),
+          g: mixed.g * s.a * (1 - b.a) + b.g * b.a * (1 - s.a),
+          b: mixed.b * s.a * (1 - b.a) + b.b * b.a * (1 - s.a),
+          a: s.a * (1 - b.a) + b.a * (1 - s.a),
+        },
+        src.cs,
+      );
 
     case Compose.Plus:
     case Compose.PlusLighter:
       // Upstream treats both as additive; `PlusLighter` is the CSS
       // `lighter` keyword that Porter-Duff calls `Plus`.
-      return premultiply({
-        r: mixed.r * src.a + bg.r * bg.a,
-        g: mixed.g * src.a + bg.g * bg.a,
-        b: mixed.b * src.a + bg.b * bg.a,
-        a: src.a + bg.a,
-      });
+      return premultiply_straight(
+        {
+          r: mixed.r * s.a + b.r * b.a,
+          g: mixed.g * s.a + b.g * b.a,
+          b: mixed.b * s.a + b.b * b.a,
+          a: s.a + b.a,
+        },
+        src.cs,
+      );
   }
 }
 
-/** Converts straight colour to premultiplied, clamping each channel. */
-export function premultiply(c: Color4): Color4 {
-  return {
-    r: clamp01(c.r * c.a),
-    g: clamp01(c.g * c.a),
-    b: clamp01(c.b * c.a),
-    a: clamp01(c.a),
-  };
+/**
+ * Converts straight colour to premultiplied, clamped per channel.
+ *
+ * This is the port's spelling of vello's `apply_alpha` premultiply, and it
+ * clamps — unlike `AlphaColor::premultiply`, which does not, because the colour
+ * crate has no reason to and vello's does not. The clamp is load-bearing for
+ * the compositing arithmetic in this module, so it is kept here rather than
+ * delegated; `ColorSpace::clip` is what a caller wants otherwise.
+ */
+export function premultiply<CS extends ColorSpace>(c: AlphaColor<CS>): PremulColor<CS> {
+  return premultiply_straight(to_straight(c), c.cs);
 }
 
-/** Converts premultiplied colour back to straight, as vello's `unpremultiply`. */
-export function unpremultiply(c: Color4): Color4 {
-  if (c.a === 0) return { r: 0, g: 0, b: 0, a: 0 };
-  return { r: c.r / c.a, g: c.g / c.a, b: c.b / c.a, a: c.a };
+/** Converts premultiplied colour back to straight, as `PremulColor::un_premultiply`. */
+export function unpremultiply<CS extends ColorSpace>(c: PremulColor<CS>): AlphaColor<CS> {
+  return c.un_premultiply();
 }
 
 /**
@@ -349,7 +438,14 @@ export function unpremultiply(c: Color4): Color4 {
  * `coverage` is the antialiased coverage of a pixel in 0..=1; a fully covered
  * pixel composites normally, a non-covered one leaves the destination alone.
  */
-export function applyCoverage(src: Color4, coverage: number): Color4 {
+export function applyCoverage<CS extends ColorSpace>(
+  src: AlphaColor<CS>,
+  coverage: number,
+): PremulColor<CS> {
   const pm = premultiply(src);
-  return { r: clamp01(pm.r * coverage), g: clamp01(pm.g * coverage), b: clamp01(pm.b * coverage), a: clamp01(pm.a * coverage) };
+  const [r, g, b, a] = pm.components;
+  return new PremulColor(
+    [clamp01(r * coverage), clamp01(g * coverage), clamp01(b * coverage), clamp01(a * coverage)],
+    src.cs,
+  );
 }

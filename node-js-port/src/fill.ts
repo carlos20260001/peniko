@@ -1,22 +1,20 @@
 /**
- * `peniko` replacement: the paint description for fills.
+ * The paint description for fills: an epaint-facing convenience layer.
  *
- * ## Why this is small
+ * ## Status of this module
  *
- * `peniko` is `vello_cpu`'s paint layer, and upstream it offers a lot:
- * gradients, image brushes, blend modes, blur, and `BlurredRoundedRect`.
- *
- * Almost none of that is reachable in this port. `epaint` does its own shape
- * tessellation in `epaint/src/tessellator.rs`; it only reaches `vello_cpu` to
- * rasterize glyphs into the font atlas, and that is always a single solid
- * fill. So the "paint description" here is genuinely one variant.
+ * It predates the restructure that brought the port back in line with peniko's
+ * own module tree, and its `Brush`, `Fill` and `Style` names now collide with
+ * the faithful ports in `brush.ts` and `style.ts`. It is therefore *not*
+ * re-exported from `lib.ts`, and its own test is the only consumer. Keep it
+ * while there is a caller; delete it when there is not.
  *
  * ## Colour types
  *
- * Colour types are **not** redefined here. `peniko` re-exports its own
- * `color` module, but the port shares `@egui-node/ecolor` with `epaint` so
- * there is exactly one colour implementation across the pipeline. `SolidFill`
- * is generic over the colour type for that reason.
+ * The port carries `color`'s own colour types now (`color/`), so a caller does
+ * not need to reach for `@egui-node/ecolor` to name a colour. This module stays
+ * generic over whatever the caller passes, which is what `SolidBrush.color`
+ * being `unknown` means.
  */
 
 /**
